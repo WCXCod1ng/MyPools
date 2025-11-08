@@ -19,4 +19,5 @@ func main() {
 		fmt.Println("i =", 100/i)
 	}
 	//redis.Pool{}
+	//sync.Pool{}
 }

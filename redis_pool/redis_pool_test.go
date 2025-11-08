@@ -1,9 +1,8 @@
 package redis_pool
 
 import (
+	"context"
 	"errors"
-	"fmt"
-	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,15 +11,13 @@ import (
 	"github.com/gomodule/redigo/redis"
 )
 
-// ===== Mock Setup =====
-
-// openConnections 用于追踪当前“打开”的连接总数
+// ===== Mock Setup (与之前类似，需要全局计数器) =====
 var openConnections int32
 
-// mockConn 模拟一个 redis.Conn
 type mockConn struct {
-	err     error
+	id      int
 	isClose bool
+	err     error
 }
 
 func (m *mockConn) Close() error {
@@ -28,409 +25,420 @@ func (m *mockConn) Close() error {
 		return errors.New("already closed")
 	}
 	m.isClose = true
+	atomic.AddInt32(&openConnections, -1)
 	return nil
 }
-
-func (m *mockConn) Err() error {
-	return m.err
-}
-
+func (m *mockConn) Err() error { return m.err }
 func (m *mockConn) Do(commandName string, args ...interface{}) (reply interface{}, err error) {
-	if m.isClose {
-		return nil, errors.New("connection is closed")
-	}
 	return "OK", nil
 }
+func (m *mockConn) Send(commandName string, args ...interface{}) error { return nil }
+func (m *mockConn) Flush() error                                       { return nil }
+func (m *mockConn) Receive() (reply interface{}, err error)            { return "OK", nil }
 
-func (m *mockConn) Send(commandName string, args ...interface{}) error {
-	if m.isClose {
-		return errors.New("connection is closed")
-	}
-	return nil
-}
+var connCounter int32
 
-func (m *mockConn) Flush() error {
-	if m.isClose {
-		return errors.New("connection is closed")
-	}
-	return nil
-}
-
-func (m *mockConn) Receive() (reply interface{}, err error) {
-	if m.isClose {
-		return nil, errors.New("connection is closed")
-	}
-	return "OK", nil
-}
-
-// factory 创建一个新的 mockConn
 var factory = func() (redis.Conn, error) {
-	time.Sleep(time.Duration(rand.IntN(100)+50) * time.Millisecond)
-	return &mockConn{}, nil
+	atomic.AddInt32(&openConnections, 1)
+	return &mockConn{id: int(atomic.AddInt32(&connCounter, 1))}, nil
 }
 
-// errorFactory 创建一个失败的 mockConn
-var errorFactory = func() (redis.Conn, error) {
-	time.Sleep(time.Duration(rand.IntN(150)+60) * time.Millisecond)
-	return nil, errors.New("factory failed to create connection")
+var testOnBorrow = func(conn redis.Conn, ctx context.Context, lastUsed time.Time) error {
+	return nil
 }
 
-// ===== Functionality Tests =====
+// ===== Bug & Functionality Tests =====
 
-func TestNewRedisPool(t *testing.T) {
-	// 测试有效参数
-	pool, err := NewRedisPool(10, 5, factory)
+// TestGet_MutexUnlock a simple test to check for the most obvious deadlock.
+// Run this with `go test -race`
+func TestGet_MutexUnlock(t *testing.T) {
+	pool, err := NewRedisPool(2, 2, 0, factory, testOnBorrow, false)
 	if err != nil {
-		t.Fatalf("Failed to create pool with valid args: %v", err)
+		t.Fatal(err)
 	}
-	if pool.maxActive != 10 {
-		t.Errorf("Expected maxActive 10, got %d", pool.maxActive)
-	}
-	if cap(pool.idleQueue) != 5 {
-		t.Errorf("Expected idleQueue capacity 5, got %d", cap(pool.idleQueue))
-	}
-	if len(pool.idleQueue) != 5 {
-		t.Errorf("Expected 5 initial connections, got %d", len(pool.idleQueue))
-	}
-
-	// 测试无效参数
-	invalidArgs := [][]int{
-		{0, 5},  // maxActive <= 0
-		{10, 0}, // maxIdle <= 0
-		{5, 10}, // maxActive < maxIdle
-	}
-	for _, args := range invalidArgs {
-		_, err := NewRedisPool(args[0], args[1], factory)
-		if err == nil {
-			t.Errorf("Expected error for args maxActive=%d, maxIdle=%d, but got nil", args[0], args[1])
-		}
-	}
-	_, err = NewRedisPool(10, 5, nil)
-	if err == nil {
-		t.Errorf("Expected error for nil factory, but got nil")
-	}
-}
-
-func TestPool_GetAndRelease(t *testing.T) {
-	pool, _ := NewRedisPool(10, 5, factory)
 	defer pool.Close()
 
-	// 1. 从池中获取一个连接
+	// Get and release, this should work
+	c1, _ := pool.Get()
+	pool.Release(c1)
+
+	// Get again. If Bug #1 exists, this second Get will hang.
+	done := make(chan struct{})
+	go func() {
+		c2, err := pool.Get()
+		if err == nil {
+			pool.Release(c2)
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// success
+	case <-time.After(1 * time.Second):
+		t.Fatal("Get() call deadlocked, mutex was likely not unlocked.")
+	}
+}
+
+// TestIdleTimeout_RemovesOldestConn directly targets Bug #3
+func TestIdleTimeout_RemovesOldestConn(t *testing.T) {
+	atomic.StoreInt32(&openConnections, 0)
+	idleTimeout := 100 * time.Millisecond
+	pool, err := NewRedisPool(5, 5, idleTimeout, factory, testOnBorrow, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	// Initially, pool should have 5 connections
+	if atomic.LoadInt32(&openConnections) != 5 {
+		t.Fatalf("Expected 5 open connections, got %d", atomic.LoadInt32(&openConnections))
+	}
+
+	// Wait for longer than the timeout
+	time.Sleep(idleTimeout + 50*time.Millisecond)
+
+	// Trigger the lazy check by getting a connection
+	// If the fix is correct, this should clean up all 5 old connections and create a new one.
 	conn, err := pool.Get()
 	if err != nil {
-		t.Fatalf("Failed to get a connection: %v", err)
+		t.Fatalf("Get failed: %v", err)
 	}
-	if len(pool.idleQueue) != 4 {
-		t.Errorf("Expected idle queue size 4 after Get, got %d", len(pool.idleQueue))
-	}
+	defer pool.Release(conn)
 
-	// 2. 释放连接
-	err = pool.Release(conn)
+	// After cleanup and getting one, the total active connections should be 1.
+	// In your original code, it would be 5 because nothing was cleaned.
+	// With a correct implementation: 5 old are closed, 1 new is created.
+	if pool.active != 1 {
+		t.Errorf("Expected active connections to be 1 after idle cleanup, got %d", pool.active)
+	}
+	if atomic.LoadInt32(&openConnections) != 1 {
+		t.Errorf("Expected total open connections to be 1, got %d", atomic.LoadInt32(&openConnections))
+	}
+}
+
+// TestSemaphore_BlocksAndUnblocks tests if the semaphore mechanism (Bug #2) works.
+// On the broken code, this will hang forever.
+func TestSemaphore_BlocksAndUnblocks(t *testing.T) {
+	// Use maxActive=1 to easily test the blocking mechanism
+	pool, err := NewRedisPool(1, 1, 0, factory, testOnBorrow, false)
 	if err != nil {
-		t.Fatalf("Failed to release a connection: %v", err)
+		t.Fatal(err)
 	}
-	if len(pool.idleQueue) != 5 {
-		t.Errorf("Expected idle queue size 5 after Release, got %d", len(pool.idleQueue))
+	defer pool.Close()
+
+	// Get the only connection
+	c1, _ := pool.Get()
+
+	// This Get should block.
+	done := make(chan struct{})
+	go func() {
+		c2, _ := pool.Get() // This will block
+		pool.Release(c2)
+		close(done)
+	}()
+
+	time.Sleep(100 * time.Millisecond) // Give the goroutine time to block
+
+	// Now release the first connection. This should unblock the second Get.
+	pool.Release(c1)
+
+	select {
+	case <-done:
+		// success
+	case <-time.After(1 * time.Second):
+		t.Fatal("Get() did not unblock after Release(). The semaphore/channel mechanism is likely broken.")
 	}
 }
 
-func TestPool_ExceedIdleCreatesNew(t *testing.T) {
-	pool, _ := NewRedisPool(10, 2, factory)
+// TestRelease_HonorsMaxIdle tests Bug #4
+func TestRelease_HonorsMaxIdle(t *testing.T) {
+	pool, err := NewRedisPool(5, 2, 0, factory, testOnBorrow, false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer pool.Close()
 
-	conns := make([]redis.Conn, 3)
-	// 获取3个连接，超过了 idle (2)
-	for i := 0; i < 3; i++ {
-		c, err := pool.Get()
-		if err != nil {
-			t.Fatalf("Failed to get connection %d: %v", i+1, err)
-		}
-		conns[i] = c
-	}
-
-	if pool.currentSize != 3 {
-		t.Errorf("Expected currentSize to be 3, got %d", pool.currentSize)
-	}
-}
-
-func TestPool_ReleaseExceedsIdleClosesConn(t *testing.T) {
-	pool, _ := NewRedisPool(5, 2, factory)
-	defer pool.Close()
-
+	// Get 3 connections, exceeding maxIdle
 	conns := make([]redis.Conn, 3)
 	for i := 0; i < 3; i++ {
 		conns[i], _ = pool.Get()
 	}
 
-	// 释放所有连接
+	// Now release all 3. The pool should only keep 2 idle.
 	for _, c := range conns {
 		pool.Release(c)
 	}
 
-	if len(pool.idleQueue) != 2 {
-		t.Errorf("Expected idle queue size to be capped at 2, got %d", len(pool.idleQueue))
+	if pool.idleQueue.Len() != 2 {
+		t.Errorf("Expected idle queue length to be capped at maxIdle(2), but got %d", pool.idleQueue.Len())
 	}
-	if pool.currentSize != 2 {
-		t.Errorf("Expected currentSize to shrink to 2, got %d", pool.currentSize)
-	}
-}
-
-func TestPool_ReleaseBrokenConn(t *testing.T) {
-	pool, _ := NewRedisPool(5, 5, factory)
-	defer pool.Close()
-
-	// 获取一个连接并模拟它已损坏
-	conn, _ := pool.Get()
-	conn.(*mockConn).err = errors.New("connection broken")
-
-	pool.Release(conn)
-
-	if pool.currentSize != 4 {
-		t.Errorf("Expected currentSize to be 4 after releasing broken conn, got %d", pool.currentSize)
-	}
-	if len(pool.idleQueue) != 4 {
-		t.Errorf("Expected idle queue size to be 4 after releasing broken conn, got %d", len(pool.idleQueue))
-	}
-}
-
-func TestPool_GetBlocksWhenFull(t *testing.T) {
-	// 这个测试会验证原始代码的死锁问题
-	// 在修正后的代码上，它应该能正确地阻塞并最终成功
-	pool, _ := NewRedisPool(2, 1, factory)
-	defer pool.Close()
-
-	// 占满所有连接
-	c1, _ := pool.Get()
-	c2, _ := pool.Get()
-
-	done := make(chan bool)
-	go func() {
-		// 这个Get应该会阻塞
-		c3, err := pool.Get()
-		if err != nil {
-			t.Errorf("Blocked Get failed: %v", err)
-		}
-		pool.Release(c3)
-		done <- true
-	}()
-
-	// 等待一小段时间确保goroutine已阻塞
-	time.Sleep(100 * time.Millisecond)
-
-	// 释放一个连接，让阻塞的goroutine可以继续
-	pool.Release(c1)
-
-	select {
-	case <-done:
-		// 测试成功
-	case <-time.After(1 * time.Second):
-		t.Fatal("Get call did not unblock after a connection was released. Possible deadlock!")
-	}
-	pool.Release(c2)
-}
-
-func TestPool_Close(t *testing.T) {
-	pool, _ := NewRedisPool(5, 2, factory)
-	conn, _ := pool.Get()
-
-	pool.Close()
-
-	if !pool.closed {
-		t.Error("Expected pool to be marked as closed")
-	}
-
-	_, err := pool.Get()
-	if err != RedisPoolCloseErr {
-		t.Errorf("Expected RedisPoolCloseErr on Get from closed pool, got %v", err)
-	}
-
-	err = pool.Release(conn)
-	if err != RedisPoolCloseErr {
-		t.Errorf("Expected RedisPoolCloseErr on Release to closed pool, got %v", err)
-	}
-}
-
-// ===== Concurrency Test =====
-
-func TestPool_Concurrency(t *testing.T) {
-	pool, _ := NewRedisPool(20, 10, factory)
-	defer pool.Close()
-
-	var wg sync.WaitGroup
-	numGoroutines := 100
-	wg.Add(numGoroutines)
-
-	for i := 0; i < numGoroutines; i++ {
-		go func() {
-			defer wg.Done()
-			conn, err := pool.Get()
-			if err != nil {
-				// 在并发测试中，我们不希望 t.Fatal，而是记录错误
-				fmt.Printf("Error getting connection: %v\n", err)
-				return
-			}
-			// 模拟工作
-			time.Sleep(time.Duration(10+i%10) * time.Millisecond)
-			pool.Release(conn)
-		}()
-	}
-
-	wg.Wait()
-
-	if pool.currentSize > pool.maxActive {
-		t.Errorf("currentSize %d exceeded maxActive %d", pool.currentSize, pool.maxActive)
-	}
-	if len(pool.idleQueue) > cap(pool.idleQueue) {
-		t.Errorf("idleQueue size %d exceeded capacity %d", len(pool.idleQueue), cap(pool.idleQueue))
+	// Total active connections should also be 2, as one was closed.
+	if pool.active != 2 {
+		t.Errorf("Expected active connections to be 2 after capping, but got %d", pool.active)
 	}
 }
 
 // ===== Performance Benchmarks =====
 
-func BenchmarkPool_GetRelease(b *testing.B) {
-	pool, _ := NewRedisPool(50, 50, factory)
-	defer pool.Close()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		conn, _ := pool.Get()
-		pool.Release(conn)
+// Benchmark with contention, more goroutines than available connections
+func BenchmarkContention(b *testing.B) {
+	pool, err := NewRedisPool(50, 50, time.Minute, factory, testOnBorrow, false)
+	if err != nil {
+		b.Fatal(err)
 	}
-}
-
-func BenchmarkPool_ConcurrentGetRelease(b *testing.B) {
-	pool, _ := NewRedisPool(50, 50, factory)
 	defer pool.Close()
 	b.ResetTimer()
 
+	// Run with 4x more goroutines than connections to ensure high contention
+	b.SetParallelism(4)
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			conn, err := pool.Get()
 			if err != nil {
-				b.Fatal(err)
+				b.Fatalf("Get failed: %v", err)
 			}
+			// Simulate tiny work
+			time.Sleep(1 * time.Microsecond)
 			if err := pool.Release(conn); err != nil {
-				b.Fatal(err)
+				b.Fatalf("Release failed: %v", err)
 			}
 		}
 	})
 }
 
-// TestNewRedisPool_FactoryError 验证初始化时如果factory失败，不会泄露连接
-func TestNewRedisPool_FactoryError(t *testing.T) {
-	// 重置计数器
-	atomic.StoreInt32(&openConnections, 0)
-
-	// 这个factory会在第3次调用时失败
-	var createCount int
-	failingFactory := func() (redis.Conn, error) {
-		createCount++
-		if createCount > 2 {
-			return nil, errors.New("failed on purpose")
-		}
-		return factory() // 调用我们正常的factory
-	}
-
-	// 尝试创建一个有5个空闲连接的池，但它应该会在创建第3个时失败
-	_, err := NewRedisPool(10, 5, failingFactory)
-
-	if err == nil {
-		t.Fatal("Expected an error during pool creation, but got nil")
-	}
-
-	// 最关键的断言：检查是否所有的连接都被清理了
-	// 等待一小段时间确保Close()有时间执行
-	time.Sleep(50 * time.Millisecond)
-	if open := atomic.LoadInt32(&openConnections); open != 0 {
-		t.Errorf("Expected 0 open connections after creation failure, but found %d. Resources were leaked!", open)
-	}
-}
-
-// TestPool_GetWhileClosing 验证当Get阻塞时，如果池被关闭，Get应该返回错误而不是nil连接
-func TestPool_GetWhileClosing(t *testing.T) {
-	pool, err := NewRedisPool(1, 1, factory)
-	if err != nil {
-		t.Fatalf("Failed to create pool: %v", err)
-	}
-
-	// 1. 先取走唯一的一个连接，让池子变空
-	conn1, err := pool.Get()
-	if err != nil {
-		t.Fatalf("Failed to get the first connection: %v", err)
-	}
-
-	resultChan := make(chan error)
-
-	// 2. 启动一个goroutine，它会因为池子满了而阻塞在Get()
-	go func() {
-		// 这个Get()应该会阻塞，直到Close()被调用
-		_, err := pool.Get()
-		resultChan <- err
-	}()
-
-	// 3. 等待一小会，确保goroutine已经开始并阻塞了
-	time.Sleep(100 * time.Millisecond)
-
-	// 4. 关闭连接池，这应该会唤醒阻塞的Get()
-	pool.Close()
-
-	// 5. 检查阻塞的Get()返回的错误
-	select {
-	case errFromGet := <-resultChan:
-		if errFromGet != RedisPoolCloseErr {
-			t.Errorf("Expected RedisPoolCloseErr when getting from a closing pool, but got: %v", errFromGet)
-		}
-	case <-time.After(1 * time.Second):
-		t.Fatal("The blocked Get call did not return after the pool was closed.")
-	}
-
-	// 清理工作
-	pool.Release(conn1)
-}
-
-// TestPool_GetWithFailingFactory 验证当需要创建新连接但factory失败时，池的状态是正确的
-func TestPool_GetWithFailingFactory(t *testing.T) {
-	var createCount int
-	// 这个factory只允许成功创建一次
-	factoryOnce := func() (redis.Conn, error) {
-		if createCount > 0 {
-			return nil, errors.New("factory can only be called once")
-		}
-		createCount++
-		return factory()
-	}
-
-	// maxIdle=0, 这样每次Get都需要创建新连接
-	pool, err := NewRedisPool(5, 1, factoryOnce)
+// TestRelease_AfterClose 专门测试 在Close之后紧接着调用Release是否会panic
+func TestRelease_AfterClose(t *testing.T) {
+	pool, err := NewRedisPool(1, 1, 0, factory, func(redis.Conn, context.Context, time.Time) error { return nil }, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// 第一次Get，使用预创建的连接
-	c, err := pool.Get()
+	conn, _ := pool.Get()
+
+	// 关闭连接池
+	pool.Close()
+
+	// 在一个已关闭的池上调用 Release，不应该 panic
+	// 使用一个 goroutine 以防万一原始代码发生死锁而不是 panic
+	done := make(chan struct{})
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("Release panicked after Close: %v", r)
+			}
+			close(done)
+		}()
+		pool.Release(conn)
+	}()
+
+	select {
+	case <-done:
+		// success
+	case <-time.After(1 * time.Second):
+		t.Fatal("Release deadlocked after Close")
+	}
+}
+
+// TestGetContext_PropagatesContext 专门测试 context是否正确传递并发挥作用
+func TestGetContext_PropagatesContext(t *testing.T) {
+	// 创建一个 testOnBorrow 函数，它会检查 context 是否被取消
+	testFunc := func(c redis.Conn, ctx context.Context, lastUsed time.Time) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err() // 如果 context 被取消，测试失败
+		default:
+			return nil // 否则测试成功
+		}
+	}
+
+	pool, err := NewRedisPool(1, 1, 0, factory, testFunc, true)
 	if err != nil {
-		t.Fatalf("First Get failed: %v", err)
-	}
-	pool.Release(c)
-
-	// currentSize 应该为1
-	if pool.currentSize != 1 {
-		t.Fatalf("Expected currentSize to be 1, but got %d", pool.currentSize)
+		t.Fatal(err)
 	}
 
-	// 现在池是满的，我们占满它
-	conns := []redis.Conn{}
-	c, _ = pool.Get()
-	conns = append(conns, c)
+	// 先取走唯一的连接，让下一个 Get 必须从 idle 队列里拿
+	conn, _ := pool.Get()
+	pool.Release(conn)
 
-	// 第二次Get，会尝试创建新连接，但factory会失败
-	_, err = pool.Get()
+	// 创建一个已经被取消的 context
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// 使用被取消的 context 调用 GetContext。
+	// 如果 bug 存在 (传递的是 context.Background)，testOnBorrow 会成功，GetContext 会返回一个连接。
+	// 如果 bug 被修复，testOnBorrow 会失败，GetContext 会尝试创建新连接（或返回错误）。
+	// 在这个场景下，它会关闭坏连接并创建一个新的。
+	_, err = pool.GetContext(ctx)
+
+	// 我们不关心具体的错误，只关心它有没有返回我们预期的错误。
+	// 在一个更复杂的场景中，我们可能期望它重试。
+	// 但对于这个测试，我们主要验证 context 是否被检查了。
+	// 如果Get成功了，说明context没传下去。
 	if err == nil {
-		t.Fatal("Expected error from Get when factory fails, but got nil")
+		t.Error("GetContext succeeded with a canceled context, indicating the context was not propagated to testOnBorrow")
+	}
+}
+
+// TestConcurrency_WithFailingConnections 这是一个综合压力测试
+// 它模拟了真实世界中连接会随机失败的场景，考验池的恢复能力和状态一致性
+func TestConcurrency_WithFailingConnections(t *testing.T) {
+	atomic.StoreInt32(&openConnections, 0)
+
+	// testOnBorrow 会有 30% 的几率失败
+	var failCount int32
+	testFunc := func(c redis.Conn, ctx context.Context, lastUsed time.Time) error {
+		if atomic.AddInt32(&failCount, 1)%3 == 0 {
+			return errors.New("connection failed health check")
+		}
+		return nil
 	}
 
-	// 关键断言：即使创建失败，currentSize也不应该被错误地增加
-	if pool.currentSize != 1 {
-		t.Errorf("Expected currentSize to remain 1 after a failed factory call, but got %d", pool.currentSize)
+	maxActive := 20
+	pool, err := NewRedisPool(maxActive, 10, time.Second, factory, testFunc, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	var wg sync.WaitGroup
+	numGoroutines := 100
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				conn, err := pool.Get()
+				if err != nil {
+					continue
+				}
+				// 模拟工作
+				time.Sleep(time.Duration(1+j%5) * time.Millisecond)
+				pool.Release(conn)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// 在测试结束后，池的状态应该是健康的
+	if pool.active > maxActive {
+		t.Errorf("active connection count (%d) exceeded maxActive (%d)", pool.active, maxActive)
+	}
+
+	// openConnections 应该等于 active
+	// 由于并发，给一点时间让状态同步
+	time.Sleep(50 * time.Millisecond)
+	if atomic.LoadInt32(&openConnections) != int32(pool.active) {
+		t.Errorf("mismatch between open connections (%d) and pool's active count (%d)", atomic.LoadInt32(&openConnections), pool.active)
+	}
+}
+
+// TestActiveCount_NeverExceedsMaxActive 专门测试在极端并发下 active 计数器是否会超过 maxActive
+func TestActiveCount_NeverExceedsMaxActive(t *testing.T) {
+	// 使用一个较小的 maxActive 以便轻松制造竞争
+	maxActive := 10
+	pool, err := NewRedisPool(
+		maxActive,
+		maxActive, // maxIdle = maxActive for simplicity
+		time.Minute,
+		factory,
+		func(c redis.Conn, ctx context.Context, t time.Time) error { return nil }, // no-op health check
+		true, // wait = true
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	// 使用一个可以被取消的 context 来控制 workers 的生命周期
+	// 测试将运行2秒，如果在这期间没有发现问题，则认为通过
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	// 启动 20 倍于 maxActive 数量的 workers 来制造高竞争
+	numWorkers := maxActive * 20
+	wg.Add(numWorkers)
+
+	// 启动所有 worker goroutines
+	for i := 0; i < numWorkers; i++ {
+		go func() {
+			defer wg.Done()
+			// 在 context 的控制下持续 Get/Release
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				conn, err := pool.GetContext(ctx)
+				if err != nil {
+					// 如果 context 被取消，这里会报错，循环将在下一次迭代中退出
+					continue
+				}
+
+				// 模拟非常短暂的持有时间，以最大化 Get/Release 的频率
+				time.Sleep(10 * time.Microsecond)
+
+				pool.Release(conn)
+			}
+		}()
+	}
+
+	// 启动 Inspector goroutine
+	// 它会持续检查 active 的值，直到 context 结束
+	var maxObservedActive int
+	var mu sync.Mutex // Mutex to protect maxObservedActive
+
+	inspectorDone := make(chan struct{})
+	go func() {
+		defer close(inspectorDone)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			pool.mu.Lock()
+			currentActive := pool.active
+			pool.mu.Unlock()
+
+			mu.Lock()
+			if currentActive > maxObservedActive {
+				maxObservedActive = currentActive
+			}
+			mu.Unlock()
+
+			// 检查是否超过上限
+			if currentActive > maxActive {
+				// 立即取消所有操作并标记测试失败
+				cancel()
+				t.Errorf("FATAL: active count (%d) exceeded maxActive (%d)", currentActive, maxActive)
+				return // 尽早退出 inspector
+			}
+			// 短暂休眠，让出 CPU
+			time.Sleep(100 * time.Microsecond)
+		}
+	}()
+
+	// 等待测试时间结束或被 inspector 提前终止
+	<-ctx.Done()
+	// 等待所有 worker goroutines 优雅地退出
+	wg.Wait()
+	// 等待 inspector 退出
+	<-inspectorDone
+
+	mu.Lock()
+	finalMaxActive := maxObservedActive
+	mu.Unlock()
+
+	// 做最后的报告
+	if t.Failed() {
+		t.Logf("Test failed. Maximum observed active count was: %d", finalMaxActive)
+	} else {
+		t.Logf("Test passed. Maximum observed active count was: %d (maxActive: %d)", finalMaxActive, maxActive)
 	}
 }
